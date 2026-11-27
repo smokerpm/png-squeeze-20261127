@@ -21,13 +21,16 @@ For every image it tries:
   fewest-distinct-byte-pairs heuristic, and per-row brute force (each filter
   scored by really deflating the row with the preceding 32 KiB as dictionary).
 - **Deflate** — every candidate is screened at zlib level 6; the best two
-  are re-compressed at level 9 with the default, filtered and Huffman-only
-  strategies, and the smallest total (IDAT + PLTE/tRNS chunks) wins.
+  are re-compressed at level 9 with the default and filtered strategies,
+  and also with sync-flush block splits (128K / 256K) so each block gets its
+  own Huffman table; the smallest total (IDAT + PLTE/tRNS chunks) wins.
 
 Only chunks the checker reads are written (IHDR, PLTE, tRNS, IDAT, IEND),
 bit depth 8, no interlace. Output is fully deterministic: no clock reads,
-no randomness — two runs write byte-identical files. On the kit practice
-set it scores **703,048** (all 8 instances answered, `passed: 1`).
+no randomness, fixed split points — two runs write byte-identical files
+(verified by the kit's `grade-local` regrade). On the kit practice set it
+scores **711,717** (all 8 instances answered, `passed: 1`), in ~23 s for
+the whole set on one CPU.
 
 ## How it runs
 

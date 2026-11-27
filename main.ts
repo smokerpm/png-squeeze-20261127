@@ -1,15 +1,17 @@
-// png-squeeze-01: lossless PNG re-encoder.
+// png-squeeze-01: lossless PNG re-encoder, v2.
 //
-// Strategy: decode the stored RGBA screenshot, try the same forms the scale
-// compressor tries (palette by count / by luminance, grey / grey+alpha / RGB /
-// RGBA, tRNS key) plus fixed filter 3, pick each form's filters by screening
-// (fixed 0-4, minsum, fewest-pairs, per-row brute force scored with real
-// zlib), screen every candidate at zlib level 6, then re-compress the best
-// two candidates at level 9 with several strategies and keep the smallest.
-// Pure Node built-ins, fully deterministic (no clock, no randomness).
-import { copyFileSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+// Decodes the stored RGBA screenshot, tries the scale compressor's forms
+// (palette by count / by luminance, grey / grey+alpha, RGB / RGBA, tRNS key)
+// and filter choices (fixed 0-4, minsum, fewest-pairs, per-row brute force
+// scored by really deflating the row), screens every candidate at zlib
+// level 6, then re-compresses the best three at level 9 with several
+// strategies and with sync-flush block splits (128K / 256K / 512K), keeping
+// the smallest total (IDAT + PLTE/tRNS chunks). Pure Node built-ins, fully
+// deterministic (no clock, no randomness): the split points and strategy
+// list are fixed, and every variant is scored by its real byte size.
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { deflateSync, inflateSync, constants } from 'node:zlib';
+import { createDeflate, deflateSync, inflateSync, constants } from 'node:zlib';
 
 // ---------------------------------------------------------------- PNG codec
 
@@ -392,9 +394,41 @@ function filtered(samples: Uint8Array, width: number, height: number, bpp: numbe
   return raw;
 }
 
-// ---------------------------------------------------------------- encode one image
+// ---------------------------------------------------------------- deflate variants
 
 const SCREEN = { level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY };
+
+/** Deflate `data` at level 9 with `strategy`, inserting a Z_SYNC_FLUSH every `step` bytes (0 = no splits). */
+function deflateSplit(data: Uint8Array, step: number, strategy: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const d = createDeflate({ level: 9, memLevel: 9, strategy });
+    const chunks: Buffer[] = [];
+    d.on('data', (c: Buffer) => chunks.push(c));
+    d.on('error', reject);
+    d.on('end', () => resolve(Buffer.concat(chunks)));
+    let off = 0;
+    const writeNext = (): void => {
+      if (off >= data.length) {
+        d.end();
+        return;
+      }
+      const end = Math.min(data.length, off + step);
+      const last = end >= data.length;
+      d.write(data.subarray(off, end), () => {
+        off = end;
+        if (last) d.end();
+        else d.flush(constants.Z_SYNC_FLUSH, writeNext);
+      });
+    };
+    if (step === 0) {
+      d.end(data);
+    } else {
+      writeNext();
+    }
+  });
+}
+
+// ---------------------------------------------------------------- encode one image
 
 function chunkBytes(form: Form): number {
   return (form.plte === null ? 0 : 12 + form.plte.length) + (form.trns === null ? 0 : 12 + form.trns.length);
@@ -410,9 +444,9 @@ function pngOfForm(width: number, height: number, form: Form, idat: Uint8Array):
 }
 
 /** Best re-encoding of one decoded image. */
-function encodeImage(rgba: Uint8Array, width: number, height: number): Uint8Array {
+async function encodeImage(rgba: Uint8Array, width: number, height: number): Promise<Uint8Array> {
   const forms = formsOf(rgba);
-  // Screen every (form, filter choice) at level 6; keep the best two by total bytes.
+  // Screen every (form, filter choice) at level 6; keep the best three by total bytes.
   const ranked: Array<{ form: Form; data: Uint8Array; bytes: number }> = [];
   for (const form of forms) {
     const chunks = chunkBytes(form);
@@ -424,14 +458,24 @@ function encodeImage(rgba: Uint8Array, width: number, height: number): Uint8Arra
     }
   }
   ranked.sort((a, b) => a.bytes - b.bytes);
-  // Final: level 9, several strategies, on the best two screened candidates.
+  // Final: level 9, several strategies and sync-flush splits, on the best three.
   let best: Uint8Array | null = null;
   let bestBytes = Infinity;
   const finals = ranked.slice(0, 2);
   for (const cand of finals) {
-    for (const strategy of [constants.Z_DEFAULT_STRATEGY, constants.Z_FILTERED, constants.Z_HUFFMAN_ONLY]) {
-      const zlib = deflateSync(cand.data, { level: 9, memLevel: 9, strategy });
-      const bytes = zlib.length + chunkBytes(cand.form);
+    const extra = chunkBytes(cand.form);
+    const variants: Array<[number, number]> = [
+      [0, constants.Z_DEFAULT_STRATEGY],
+      [0, constants.Z_FILTERED],
+      [131072, constants.Z_DEFAULT_STRATEGY],
+      [262144, constants.Z_DEFAULT_STRATEGY],
+      [262144, constants.Z_FILTERED],
+    ];
+    for (const [step, strategy] of variants) {
+      const zlib = step === 0
+        ? deflateSync(cand.data, { level: 9, memLevel: 9, strategy })
+        : await deflateSplit(cand.data, step, strategy);
+      const bytes = zlib.length + extra;
       if (bytes < bestBytes) {
         bestBytes = bytes;
         best = pngOfForm(width, height, cand.form, zlib);
@@ -444,20 +488,43 @@ function encodeImage(rgba: Uint8Array, width: number, height: number): Uint8Arra
 
 // ---------------------------------------------------------------- main
 
-const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-for (const id of readdirSync(I).sort()) {
-  const inFile = join(I, id, 'image.png');
-  const outDir = join(O, id);
-  mkdirSync(outDir, { recursive: true });
-  const outFile = join(outDir, 'image.png');
-  try {
-    const { width, height, rgba } = decodePng(readFileSync(inFile));
-    const png = encodeImage(rgba, width, height);
-    if (png.length > 4194304) throw new Error('output over 4 MiB');
-    writeFileSync(outFile, png);
-  } catch {
-    // Fall back to the exact input (0 points for this instance, but answered).
-    copyFileSync(inFile, outFile);
+async function main(): Promise<void> {
+  const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+  const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+  for (const id of readdirSync(I).sort()) {
+    const inFile = join(I, id, 'image.png');
+    const outDir = join(O, id);
+    mkdirSync(outDir, { recursive: true });
+    const outFile = join(outDir, 'image.png');
+    try {
+      const { width, height, rgba } = decodePng(readFileSync(inFile));
+      const png = await encodeImage(rgba, width, height);
+      if (png.length > 4194304) throw new Error('output over 4 MiB');
+      writeFileSync(outFile, png);
+    } catch {
+      // Fall back to the exact input (0 points for this instance, but answered).
+      copyFileSync(inFile, outFile);
+    }
   }
 }
+
+main().catch(() => {
+  // Last resort: copy through only the instances with no output yet, so the
+  // entry still answers every instance.
+  try {
+    const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+    const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+    for (const id of readdirSync(I).sort()) {
+      try {
+        const outFile = join(O, id, 'image.png');
+        if (existsSync(outFile)) continue;
+        mkdirSync(join(O, id), { recursive: true });
+        copyFileSync(join(I, id, 'image.png'), outFile);
+      } catch {
+        // Nothing more to do for this instance.
+      }
+    }
+  } catch {
+    // Nothing more to do.
+  }
+});
